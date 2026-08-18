@@ -47,7 +47,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"⚡ 计算设备: {DEVICE}")
 
 # =========================================================================
-# 🏗️ 3. 深度情景感知门控路由器 (Deep Regime-Aware Router Network)
+# 🏗️ 3. 严格 Top-2 稀疏门控网络 (双轨可微与水量守恒)
 # =========================================================================
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=8):
@@ -78,12 +78,7 @@ class SpatialAttention(nn.Module):
         scale = self.sigmoid(self.conv(torch.cat([avg_out, max_out], dim=1)))
         return x * scale
 
-class PairwiseRankingRouter(nn.Module):
-    """【成对排序门控路由器】：
-    1. 39 维时空特征输入 (33 环境特征 + 3 预测 + 3 显式残差)；
-    2. 双重 CBAM 注意力与扩张卷积决策；
-    3. 输出未归一化 Logits (供 Margin Ranking Loss 直接约束次序) 与 Softmax 权重。
-    """
+class StrictlyConservedTop2Router(nn.Module):
     def __init__(self, in_channels=33, num_experts=3):
         super().__init__()
         total_in_channels = in_channels + num_experts + 3
@@ -110,41 +105,59 @@ class PairwiseRankingRouter(nn.Module):
         p2 = exp_b[:, 1:2, :, :]
         p3 = exp_b[:, 2:3, :, :]
 
-        p_max = torch.max(exp_b, dim=1, keepdim=True)[0]
+        p_base = torch.max(p1, p2)
         diff_12 = F.relu(p1 - p2)
         diff_32 = F.relu(p3 - p2)
 
-        feat_combined = torch.cat([x, exp_b, p_max, diff_12, diff_32], dim=1) # (B, 39, H, W)
+        feat_in = torch.cat([x, exp_b, p_base, diff_12, diff_32], dim=1) # (B, 39, H, W)
         
-        feat = self.stem(feat_combined)
+        feat = self.stem(feat_in)
         feat = self.ca(feat)
         feat = self.sa(feat)
         logits = self.head(feat) # (B, 3, H, W)
 
-        # 保持处处可微的 Smooth Softmax (无硬截断，彻底避免梯度死锁)
-        weights = F.softmax(logits, dim=1)
-        return weights, logits
+        # 1. 未截断稠密权重 (用于畅通反向传播梯度)
+        w_dense = F.softmax(logits, dim=1)
+
+        # 2. 严格 Top-2 稀疏掩膜截断 (第 3 名设为 -1e4)
+        top2_vals, _ = torch.topk(logits, k=2, dim=1)
+        min_top2_val = top2_vals[:, 1:2, :, :]
+        masked_logits = torch.where(
+            logits >= min_top2_val,
+            logits,
+            torch.tensor(-1e4, device=logits.device)
+        )
+        w_sparse_raw = F.softmax(masked_logits, dim=1)
+
+        # 3. 注入无雨物理干湿门控 (保证严格水量守恒)
+        wet_mask = (p1 >= DRIZZLE_THRESHOLD).float()
+        w_sparse = w_sparse_raw * wet_mask
+        
+        p_fusion = torch.sum(w_sparse * exp_b, dim=1, keepdim=True)
+
+        return w_sparse, w_dense, p_fusion, logits
 
 # =========================================================================
-# 🌟 4. 显式 Top-2 成对对序边际损失 (Pairwise Top-2 Margin Ranking Loss)
+# 🌟 4. 三元协同对齐 + 成对排序边际联合损失 (Triple Synergistic Loss)
 # =========================================================================
-class PairwiseTop2MarginLoss(nn.Module):
-    """【显式 Top-2 对序边际损失】：
-    1. 主预测加权 Huber Loss (保证总体拟合)；
-    2. 显式成对对序 Hinge 损失：强迫最优前两名专家的 Logit 至少比最差专家高出 margin (m=1.2)。
-    """
-    def __init__(self, delta=3.0, rank_weight=0.8, margin=1.2):
+class TripleSynergyBalancedLoss(nn.Module):
+    def __init__(self, delta=3.0, align_w=0.8, rank_w=1.5, target_w=1.2, margin=1.8, tau=2.0):
         super().__init__()
         self.delta = delta
-        self.rank_w = rank_weight
+        self.align_w = align_w
+        self.rank_w = rank_w
+        self.target_w = target_w
         self.margin = margin
+        self.tau = tau
 
-    def forward(self, p_fusion, expert_preds, logits, target, station_mask):
+    def forward(self, p_fusion, expert_preds, w_sparse, w_dense, logits, target, station_mask):
         valid_count = torch.sum(station_mask)
         if valid_count == 0:
             return torch.tensor(0.0, device=p_fusion.device, requires_grad=True)
 
-        # 1. 主预测加权 Huber Loss
+        w_sample = 1.0 + (target / 10.0)
+
+        # 1. 拟合 Huber Loss
         err = target - p_fusion
         abs_err = torch.abs(err)
         huber_loss = torch.where(
@@ -152,40 +165,45 @@ class PairwiseTop2MarginLoss(nn.Module):
             0.5 * (err ** 2),
             self.delta * abs_err - 0.5 * (self.delta ** 2)
         )
-        sample_weights = 1.0 + (target / 15.0) ** 2
-        weighted_huber = huber_loss * sample_weights * station_mask
-        loss_pred = torch.sum(weighted_huber) / (torch.sum(station_mask * sample_weights) + 1e-8)
+        loss_huber = torch.sum(huber_loss * w_sample * station_mask) / (torch.sum(station_mask * w_sample) + 1e-8)
 
-        # 🌟 2. 显式 Top-2 成对对序边际损失 (Pairwise Margin Loss)
-        # 计算三大专家的实测绝对误差: (B, 3, H, W)
-        expert_abs_errors = torch.abs(expert_preds - target)
-        
-        # 提取各个专家的误差与 Logits
+        # 2. 专家对齐损失 (消除投机抵消)
+        expert_abs_errors = torch.abs(expert_preds - target) # (B, 3, H, W)
+        expected_error = torch.sum(w_sparse * expert_abs_errors, dim=1, keepdim=True)
+        loss_align = torch.sum(expected_error * w_sample * station_mask) / (torch.sum(station_mask * w_sample) + 1e-8)
+
+        # 3. 显式成对对序边际损失 (直接作用于 Logits)
         e1, e2, e3 = expert_abs_errors[:, 0:1, :, :], expert_abs_errors[:, 1:2, :, :], expert_abs_errors[:, 2:3, :, :]
         z1, z2, z3 = logits[:, 0:1, :, :], logits[:, 1:2, :, :], logits[:, 2:3, :, :]
 
-        # 判定哪个专家是真实误差最大的“劣质专家 (Worst)”
         is_e1_worst = (e1 >= e2) & (e1 >= e3)
         is_e2_worst = (e2 >= e1) & (e2 >= e3)
         is_e3_worst = (e3 >= e1) & (e3 >= e2)
 
-        # 当专家 1 最差时，惩罚 z2 - z1 < m 和 z3 - z1 < m
         loss_w1 = F.relu(self.margin - (z2 - z1)) + F.relu(self.margin - (z3 - z1))
-        # 当专家 2 最差时，惩罚 z1 - z2 < m 和 z3 - z2 < m
         loss_w2 = F.relu(self.margin - (z1 - z2)) + F.relu(self.margin - (z3 - z2))
-        # 当专家 3 最差时 (如中雨日)，惩罚 z1 - z3 < m 和 z2 - z3 < m
         loss_w3 = F.relu(self.margin - (z1 - z3)) + F.relu(self.margin - (z2 - z3))
 
-        pairwise_rank_loss = (
+        pairwise_rank = (
             is_e1_worst.float() * loss_w1 +
             is_e2_worst.float() * loss_w2 +
             is_e3_worst.float() * loss_w3
         )
+        loss_rank = torch.sum(pairwise_rank * w_sample * station_mask) / (torch.sum(station_mask * w_sample) + 1e-8)
 
-        weighted_rank = pairwise_rank_loss * sample_weights * station_mask
-        loss_rank = torch.sum(weighted_rank) / (torch.sum(station_mask * sample_weights) + 1e-8)
+        # 4. 纯净 Top-2 目标分布交叉熵
+        worst_mask = (is_e1_worst.float() * torch.tensor([1.0, 0.0, 0.0], device=DEVICE).view(1, 3, 1, 1) +
+                      is_e2_worst.float() * torch.tensor([0.0, 1.0, 0.0], device=DEVICE).view(1, 3, 1, 1) +
+                      is_e3_worst.float() * torch.tensor([0.0, 0.0, 1.0], device=DEVICE).view(1, 3, 1, 1))
 
-        return loss_pred + self.rank_w * loss_rank
+        masked_errors = expert_abs_errors + worst_mask * 1e4
+        target_q = F.softmax(-masked_errors / self.tau, dim=1)
+        
+        eps = 1e-7
+        ce_dense = -torch.sum(target_q * torch.log(w_dense + eps), dim=1, keepdim=True)
+        loss_target = torch.sum(ce_dense * w_sample * station_mask) / (torch.sum(station_mask * w_sample) + 1e-8)
+
+        return loss_huber + self.align_w * loss_align + self.rank_w * loss_rank + self.target_w * loss_target
 
 # =========================================================================
 # 📊 5. 学术指标计算
@@ -229,7 +247,7 @@ class MOEDataset(Dataset):
 # =========================================================================
 def main():
     print("=" * 75)
-    print("🔥 开始训练【成对排序约束 Top-2 优化 MOE 路由系统】...")
+    print("🔥 开始训练【严格 Top-2 选型优化 MOE 路由系统】...")
 
     router_inputs = torch.load(router_inputs_pt)
     expert_preds  = torch.load(expert_preds_pt)
@@ -274,14 +292,14 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
     val_loader   = DataLoader(val_ds, batch_size=32, shuffle=False)
 
-    router_model = PairwiseRankingRouter(in_channels=33, num_experts=3).to(DEVICE)
+    router_model = StrictlyConservedTop2Router(in_channels=33, num_experts=3).to(DEVICE)
     optimizer = torch.optim.AdamW(router_model.parameters(), lr=8e-4, weight_decay=1e-4)
-    criterion = PairwiseTop2MarginLoss(delta=3.0, rank_weight=0.8, margin=1.2)
+    criterion = TripleSynergyBalancedLoss(delta=3.0, align_w=0.8, rank_w=1.5, target_w=1.2, margin=1.8, tau=2.0)
 
     best_val_loss = float('inf')
     epochs = 40
 
-    print("\n⚡ 开始成对排序 MOE 路由训练 (40 Epochs)...")
+    print("\n⚡ 开始 Top-2 对序与目标匹配协同训练 (40 Epochs)...")
     for epoch in range(1, epochs + 1):
         router_model.train()
         train_loss = 0.0
@@ -289,17 +307,9 @@ def main():
             x_b, exp_b, y_b = x_b.to(DEVICE), exp_b.to(DEVICE), y_b.to(DEVICE)
             optimizer.zero_grad()
             
-            weights, logits = router_model(x_b, exp_b)
-            p_fusion = torch.sum(weights * exp_b, dim=1, keepdim=True)
+            w_sparse, w_dense, p_fusion, logits = router_model(x_b, exp_b)
+            loss = criterion(p_fusion, exp_b, w_sparse, w_dense, logits, y_b, mask.to(DEVICE))
             
-            asset1_p = exp_b[:, 0:1, :, :]
-            p_fusion_gated = torch.where(
-                (asset1_p < DRIZZLE_THRESHOLD) | (p_fusion < DRIZZLE_THRESHOLD),
-                torch.tensor(0.0, device=p_fusion.device),
-                p_fusion
-            )
-            
-            loss = criterion(p_fusion_gated, exp_b, logits, y_b, mask.to(DEVICE))
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * x_b.size(0)
@@ -310,17 +320,8 @@ def main():
         with torch.no_grad():
             for x_b, exp_b, y_b in val_loader:
                 x_b, exp_b, y_b = x_b.to(DEVICE), exp_b.to(DEVICE), y_b.to(DEVICE)
-                weights, logits = router_model(x_b, exp_b)
-                p_fusion = torch.sum(weights * exp_b, dim=1, keepdim=True)
-                
-                asset1_p = exp_b[:, 0:1, :, :]
-                p_fusion_gated = torch.where(
-                    (asset1_p < DRIZZLE_THRESHOLD) | (p_fusion < DRIZZLE_THRESHOLD),
-                    torch.tensor(0.0, device=p_fusion.device),
-                    p_fusion
-                )
-                
-                loss = criterion(p_fusion_gated, exp_b, logits, y_b, mask.to(DEVICE))
+                w_sparse, w_dense, p_fusion, logits = router_model(x_b, exp_b)
+                loss = criterion(p_fusion, exp_b, w_sparse, w_dense, logits, y_b, mask.to(DEVICE))
                 val_loss += loss.item() * x_b.size(0)
         val_loss /= len(val_ds)
 
@@ -333,9 +334,9 @@ def main():
 
         print(f"Epoch [{epoch:02d}/{epochs:02d}] | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} {saved_mark}")
 
-    # 全流域推演与导出
+    # 全流域推演与导出 (严格绝对水量守恒)
     print("\n" + "=" * 75)
-    print("🌐 正在执行全网格成对排序 MOE 推理与导出...")
+    print("🌐 正在执行全网格绝对水量守恒 MOE 推理与导出...")
     full_ds = MOEDataset(router_inputs, expert_preds, station_target)
     full_loader = DataLoader(full_ds, batch_size=64, shuffle=False)
 
@@ -348,20 +349,12 @@ def main():
     with torch.no_grad():
         for x_b, exp_b, _ in full_loader:
             x_b, exp_b = x_b.to(DEVICE), exp_b.to(DEVICE)
-            weights, _ = router_model(x_b, exp_b)
-            p_raw = torch.sum(weights * exp_b, dim=1, keepdim=True)
-            
-            asset1_p = exp_b[:, 0:1, :, :]
-            p_final = torch.where(
-                (asset1_p < DRIZZLE_THRESHOLD) | (p_raw < DRIZZLE_THRESHOLD),
-                torch.tensor(0.0, device=p_raw.device),
-                p_raw
-            )
+            w_sparse, _, p_final, _ = router_model(x_b, exp_b)
             
             p_fusion_list.append(p_final.cpu().numpy())
-            w1_list.append(weights[:, 0:1, :, :].cpu().numpy())
-            w2_list.append(weights[:, 1:2, :, :].cpu().numpy())
-            w3_list.append(weights[:, 2:3, :, :].cpu().numpy())
+            w1_list.append(w_sparse[:, 0:1, :, :].cpu().numpy())
+            w2_list.append(w_sparse[:, 1:2, :, :].cpu().numpy())
+            w3_list.append(w_sparse[:, 2:3, :, :].cpu().numpy())
 
     p_fusion_arr = np.concatenate(p_fusion_list, axis=0)[:, 0, :, :]
     w1_arr = np.concatenate(w1_list, axis=0)[:, 0, :, :]
@@ -371,11 +364,11 @@ def main():
     # 复盘
     val_indices = np.where(val_mask_idx)[0]
     metrics_list = []
-    
-    log_lines = []
-    log_lines.append("==================================================================================")
-    log_lines.append("🏆【成对排序 Top-2 优化 MOE】2020-2024 独立盲测全域复盘")
-    log_lines.append("==================================================================================")
+    log_lines = [
+        "==================================================================================",
+        "🏆【严格 Top-2 选型优化 MOE】2020-2024 独立盲测全域复盘",
+        "=================================================================================="
+    ]
 
     for st_name, (r_idx, c_idx) in station_coords.items():
         obs_st = station_target.numpy()[val_indices, 0, r_idx, c_idx]
@@ -384,16 +377,17 @@ def main():
         rmse, r2, cc, pod, far, csi = calc_metrics(obs_st, pred_st, threshold=0.1)
         metrics_list.append([rmse, r2, cc, pod, far, csi])
 
-        w1_avg = w1_arr[val_indices, r_idx, c_idx].mean() * 100
-        w2_avg = w2_arr[val_indices, r_idx, c_idx].mean() * 100
-        w3_avg = w3_arr[val_indices, r_idx, c_idx].mean() * 100
+        wet_days = (obs_st >= DRIZZLE_THRESHOLD)
+        w1_avg = (w1_arr[val_indices, r_idx, c_idx][wet_days].mean() if wet_days.sum() > 0 else 0.0) * 100
+        w2_avg = (w2_arr[val_indices, r_idx, c_idx][wet_days].mean() if wet_days.sum() > 0 else 0.0) * 100
+        w3_avg = (w3_arr[val_indices, r_idx, c_idx][wet_days].mean() if wet_days.sum() > 0 else 0.0) * 100
 
         log_lines.append(f"📍 盲测站点【 {st_name:<4} 】| RMSE: {rmse:5.2f} mm/d | R²: {r2:5.3f} | CC: {cc:5.3f} | POD: {pod:4.2f} | FAR: {far:4.2f} | CSI: {csi:4.2f}")
-        log_lines.append(f"   └─► 专家平均权重占比: 资产1(微地形)={w1_avg:4.1f}% | 资产2(时空)={w2_avg:4.1f}% | 资产3(极值)={w3_avg:4.1f}%")
+        log_lines.append(f"   └─► 湿润日专家权重占比: 资产1(微地形)={w1_avg:4.1f}% | 资产2(时空)={w2_avg:4.1f}% | 资产3(极值)={w3_avg:4.1f}%")
 
     avg_m = np.mean(metrics_list, axis=0)
     log_lines.append("----------------------------------------------------------------------------------")
-    log_lines.append(f"🏆【成对排序版全局 4 站平均】| RMSE: {avg_m[0]:5.2f} mm/d | R²: {avg_m[1]:5.3f} | CC: {avg_m[2]:5.3f} | POD: {avg_m[3]:4.2f} | FAR: {avg_m[4]:4.2f} | CSI: {avg_m[5]:4.2f}")
+    log_lines.append(f"🏆【全局 4 站平均】| RMSE: {avg_m[0]:5.2f} mm/d | R²: {avg_m[1]:5.3f} | CC: {avg_m[2]:5.3f} | POD: {avg_m[3]:4.2f} | FAR: {avg_m[4]:4.2f} | CSI: {avg_m[5]:4.2f}")
     log_lines.append("==================================================================================")
 
     full_log_text = "\n".join(log_lines)
@@ -402,8 +396,6 @@ def main():
     with open(txt_result_path, "w", encoding="utf-8") as f:
         f.write(full_log_text + "\n\nBest Val Loss: " + f"{best_val_loss:.4f}\n")
 
-    # 物理裁剪与 NetCDF 导出
-    print("\n✂️ 正在将 MOE 降水场与专家权重图裁剪至【北江不规则流域边界】...")
     p_fusion_arr[:, ~basin_mask_2d] = np.nan
     w1_arr[:, ~basin_mask_2d] = np.nan
     w2_arr[:, ~basin_mask_2d] = np.nan
@@ -422,16 +414,12 @@ def main():
             'lon': ds_gpm.lon
         },
         attrs={
-            'description': 'Pairwise Top-2 Ranking Optimized MOE Fusion System',
+            'description': 'Strictly Water-Conserved Top-2 MOE Fusion System',
             'spatial_mask': 'Clipped to irregular watershed boundary using DEM mask'
         }
     )
-    
     ds_moe.to_netcdf(nc_moe_fusion_out)
-    
-    print("=" * 75)
-    print(f"🎉 🎉 🎉 成对排序 Top-2 优化 MOE 完工！已保存至:\n  📦 {nc_moe_fusion_out}")
-    print("=" * 75)
+    print(f"🎉 NetCDF 导出完成: {nc_moe_fusion_out}")
 
 if __name__ == "__main__":
     main()
