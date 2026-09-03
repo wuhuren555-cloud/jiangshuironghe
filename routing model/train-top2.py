@@ -81,7 +81,7 @@ class SpatialAttention(nn.Module):
 class StrictlyConservedTop2Router(nn.Module):
     def __init__(self, in_channels=33, num_experts=3):
         super().__init__()
-        total_in_channels = in_channels + num_experts + 3
+        total_in_channels = in_channels + num_experts + 3 # 33 + 3 + 3 = 39
         
         self.stem = nn.Sequential(
             nn.Conv2d(total_in_channels, 64, kernel_size=3, padding=1),
@@ -134,7 +134,6 @@ class StrictlyConservedTop2Router(nn.Module):
         w_sparse = w_sparse_raw * wet_mask
         
         p_fusion = torch.sum(w_sparse * exp_b, dim=1, keepdim=True)
-
         return w_sparse, w_dense, p_fusion, logits
 
 # =========================================================================
@@ -206,20 +205,34 @@ class TripleSynergyBalancedLoss(nn.Module):
         return loss_huber + self.align_w * loss_align + self.rank_w * loss_rank + self.target_w * loss_target
 
 # =========================================================================
-# 📊 5. 学术指标计算
+# 📊 5. 综合全套学术指标计算函数 (含 MAE, MSE, RMSE, R², NSE, KGE, CC, POD, FAR, CSI)
 # =========================================================================
-def calc_metrics(obs, pred, threshold=0.1):
+def calc_all_metrics(obs, pred, threshold=0.1):
     valid_mask = ~np.isnan(obs) & ~np.isnan(pred)
-    o, p = obs[valid_mask], pred[valid_mask]
+    o = np.array(obs)[valid_mask]
+    p = np.array(pred)[valid_mask]
     if len(o) == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        return {k: 0.0 for k in ['MAE', 'MSE', 'RMSE', 'R2', 'NSE', 'KGE', 'CC', 'POD', 'FAR', 'CSI']}
 
-    rmse = np.sqrt(np.mean((p - o) ** 2))
+    mae = np.mean(np.abs(p - o))
+    mse = np.mean((p - o) ** 2)
+    rmse = np.sqrt(mse)
+
     ss_res = np.sum((o - p) ** 2)
     ss_tot = np.sum((o - np.mean(o)) ** 2)
-    r2 = 1.0 - (ss_res / (ss_tot + 1e-8)) if ss_tot > 1e-6 else 0.0
-    cc = np.corrcoef(o, p)[0, 1] if (np.std(o) > 1e-6 and np.std(p) > 1e-6) else 0.0
+    nse = 1.0 - (ss_res / (ss_tot + 1e-8)) if ss_tot > 1e-6 else 0.0
+    r2 = nse  # 水文水资源学确定性系数标准定义与 NSE 一致
 
+    std_o, std_p = np.std(o), np.std(p)
+    mean_o, mean_p = np.mean(o), np.mean(p)
+    cc = np.corrcoef(o, p)[0, 1] if (std_o > 1e-6 and std_p > 1e-6) else 0.0
+
+    # Kling-Gupta Efficiency (KGE, 2009 标准定义)
+    alpha = std_p / (std_o + 1e-8)
+    beta = mean_p / (mean_o + 1e-8)
+    kge = 1.0 - np.sqrt((cc - 1.0) ** 2 + (alpha - 1.0) ** 2 + (beta - 1.0) ** 2)
+
+    # 降水事件分类列联表指标 (阈值默认 0.1 mm/d)
     hits = np.sum((o >= threshold) & (p >= threshold))
     misses = np.sum((o >= threshold) & (p < threshold))
     false_alarms = np.sum((o < threshold) & (p >= threshold))
@@ -228,7 +241,11 @@ def calc_metrics(obs, pred, threshold=0.1):
     far = false_alarms / (hits + false_alarms + 1e-8)
     csi = hits / (hits + misses + false_alarms + 1e-8)
 
-    return rmse, r2, cc, pod, far, csi
+    return {
+        'MAE': mae, 'MSE': mse, 'RMSE': rmse,
+        'R2': r2, 'NSE': nse, 'KGE': kge, 'CC': cc,
+        'POD': pod, 'FAR': far, 'CSI': csi
+    }
 
 class MOEDataset(Dataset):
     def __init__(self, router_inputs, expert_preds, target):
@@ -243,11 +260,11 @@ class MOEDataset(Dataset):
         return self.x[idx], self.experts[idx], self.target[idx]
 
 # =========================================================================
-# 🚀 6. 主训练与导出程序
+# 🚀 6. 主训练与多集评估导出程序
 # =========================================================================
 def main():
-    print("=" * 75)
-    print("🔥 开始训练【严格 Top-2 选型优化 MOE 路由系统】...")
+    print("=" * 85)
+    print("🔥 开始训练【严格 Top-2 选型优化 MOE 路由系统】(三集划分与十项指标全景评估)...")
 
     router_inputs = torch.load(router_inputs_pt)
     expert_preds  = torch.load(expert_preds_pt)
@@ -283,14 +300,18 @@ def main():
             if d_str in date_to_idx:
                 station_target[date_to_idx[d_str], 0, r_idx, c_idx] = float(d_row['station_rain'])
 
-    train_mask_idx = (gpm_dates_str < '2020-01-01')
-    val_mask_idx   = (gpm_dates_str >= '2020-01-01')
+    # 🌟 严格三集划分 (训练集: 2012–2019, 验证集: 2020–2021, 测试集: 2022–2024)
+    train_mask_idx = (gpm_dates_str >= '2012-01-01') & (gpm_dates_str <= '2019-12-31')
+    val_mask_idx   = (gpm_dates_str >= '2020-01-01') & (gpm_dates_str <= '2021-12-31')
+    test_mask_idx  = (gpm_dates_str >= '2022-01-01') & (gpm_dates_str <= '2024-12-31')
+
+    print(f"📊 样本序列划分: 训练集={np.sum(train_mask_idx)}天 (2012-2019) | 验证集={np.sum(val_mask_idx)}天 (2020-2021) | 测试集={np.sum(test_mask_idx)}天 (2022-2024)")
 
     train_ds = MOEDataset(router_inputs[train_mask_idx], expert_preds[train_mask_idx], station_target[train_mask_idx])
-    val_ds   = MOEDataset(router_inputs[val_mask_idx], expert_preds[val_mask_idx], station_target[val_mask_idx])
+    val_ds   = MOEDataset(router_inputs[val_mask_idx],   expert_preds[val_mask_idx],   station_target[val_mask_idx])
 
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=32, shuffle=False)
+    val_loader   = DataLoader(val_ds,   batch_size=32, shuffle=False)
 
     router_model = StrictlyConservedTop2Router(in_channels=33, num_experts=3).to(DEVICE)
     optimizer = torch.optim.AdamW(router_model.parameters(), lr=8e-4, weight_decay=1e-4)
@@ -334,8 +355,10 @@ def main():
 
         print(f"Epoch [{epoch:02d}/{epochs:02d}] | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} {saved_mark}")
 
-    # 全流域推演与导出 (严格绝对水量守恒)
-    print("\n" + "=" * 75)
+    # =========================================================================
+    # 🌐 7. 全网格推演与导出 (严格绝对水量守恒)
+    # =========================================================================
+    print("\n" + "=" * 85)
     print("🌐 正在执行全网格绝对水量守恒 MOE 推理与导出...")
     full_ds = MOEDataset(router_inputs, expert_preds, station_target)
     full_loader = DataLoader(full_ds, batch_size=64, shuffle=False)
@@ -361,41 +384,105 @@ def main():
     w2_arr = np.concatenate(w2_list, axis=0)[:, 0, :, :]
     w3_arr = np.concatenate(w3_list, axis=0)[:, 0, :, :]
 
-    # 复盘
-    val_indices = np.where(val_mask_idx)[0]
-    metrics_list = []
-    log_lines = [
-        "==================================================================================",
-        "🏆【严格 Top-2 选型优化 MOE】2020-2024 独立盲测全域复盘",
-        "=================================================================================="
+    # =========================================================================
+    # 📊 8. 三集评估与两张标准学术表格生成
+    # =========================================================================
+    train_indices = np.where(train_mask_idx)[0]
+    val_indices   = np.where(val_mask_idx)[0]
+    test_indices  = np.where(test_mask_idx)[0]
+
+    def extract_split_pairs(split_indices):
+        obs_all, pred_all = [], []
+        for st_name, (r_idx, c_idx) in station_coords.items():
+            obs_st = station_target.numpy()[split_indices, 0, r_idx, c_idx]
+            pred_st = p_fusion_arr[split_indices, r_idx, c_idx]
+            obs_all.append(obs_st)
+            pred_all.append(pred_st)
+        return np.concatenate(obs_all), np.concatenate(pred_all)
+
+    # 提取三集观测与预测值
+    train_obs, train_pred = extract_split_pairs(train_indices)
+    val_obs,   val_pred   = extract_split_pairs(val_indices)
+    test_obs,  test_pred  = extract_split_pairs(test_indices)
+
+    metrics_train = calc_all_metrics(train_obs, train_pred, threshold=0.1)
+    metrics_val   = calc_all_metrics(val_obs,   val_pred,   threshold=0.1)
+    metrics_test  = calc_all_metrics(test_obs,  test_pred,  threshold=0.1)
+
+    # -------------------------------------------------------------------------
+    # 📑 表 1：三集训练 / 评估指标全景对比表
+    # -------------------------------------------------------------------------
+    metric_names = ['MAE', 'MSE', 'RMSE', 'R2', 'NSE', 'KGE', 'CC', 'POD', 'FAR', 'CSI']
+    metric_units = {
+        'MAE': 'mm/d', 'MSE': 'mm²/d²', 'RMSE': 'mm/d',
+        'R2': '—', 'NSE': '—', 'KGE': '—', 'CC': '—',
+        'POD': '—', 'FAR': '—', 'CSI': '—'
+    }
+    metric_display_names = {
+        'MAE': 'MAE', 'MSE': 'MSE', 'RMSE': 'RMSE',
+        'R2': 'R²', 'NSE': 'NSE', 'KGE': 'KGE', 'CC': 'CC',
+        'POD': 'POD', 'FAR': 'FAR', 'CSI': 'CSI'
+    }
+
+    table1_lines = [
+        "\n" + "=" * 88,
+        "📌【三集训练 / 评估指标全景对比表】",
+        "=" * 88,
+        f"{'评估指标':<10} | {'单位':<10} | {'训练集 (2012–2019)':<18} | {'验证集 (2020–2021)':<18} | {'测试集 (2022–2024)':<18}",
+        "-" * 88
     ]
 
+    for m in metric_names:
+        disp_m = metric_display_names[m]
+        unit = metric_units[m]
+        v_train = metrics_train[m]
+        v_val   = metrics_val[m]
+        v_test  = metrics_test[m]
+        table1_lines.append(f"{disp_m:<12} | {unit:<10} | {v_train:<18.3f} | {v_val:<18.3f} | {v_test:<18.3f}")
+
+    table1_lines.append("=" * 88)
+    table1_text = "\n".join(table1_lines)
+
+    # -------------------------------------------------------------------------
+    # 📑 表 2：站点详情 (测试集: 2022–2024)
+    # -------------------------------------------------------------------------
+    table2_lines = [
+        "\n" + "=" * 108,
+        "📍【站点详情 (测试集 2022–2024 纯盲测)】",
+        "=" * 108,
+        f"{'站点':<8} | {'MSE(mm²/d²)':<12} | {'MAE(mm/d)':<10} | {'RMSE(mm/d)':<11} | {'R²':<8} | {'NSE':<8} | {'KGE':<8} | {'POD':<7} | {'FAR':<7} | {'CSI':<7}",
+        "-" * 108
+    ]
+
+    station_metrics_test = {}
     for st_name, (r_idx, c_idx) in station_coords.items():
-        obs_st = station_target.numpy()[val_indices, 0, r_idx, c_idx]
-        pred_st = p_fusion_arr[val_indices, r_idx, c_idx]
-        
-        rmse, r2, cc, pod, far, csi = calc_metrics(obs_st, pred_st, threshold=0.1)
-        metrics_list.append([rmse, r2, cc, pod, far, csi])
+        obs_st  = station_target.numpy()[test_indices, 0, r_idx, c_idx]
+        pred_st = p_fusion_arr[test_indices, r_idx, c_idx]
+        m_st = calc_all_metrics(obs_st, pred_st, threshold=0.1)
+        station_metrics_test[st_name] = m_st
 
-        wet_days = (obs_st >= DRIZZLE_THRESHOLD)
-        w1_avg = (w1_arr[val_indices, r_idx, c_idx][wet_days].mean() if wet_days.sum() > 0 else 0.0) * 100
-        w2_avg = (w2_arr[val_indices, r_idx, c_idx][wet_days].mean() if wet_days.sum() > 0 else 0.0) * 100
-        w3_avg = (w3_arr[val_indices, r_idx, c_idx][wet_days].mean() if wet_days.sum() > 0 else 0.0) * 100
+        table2_lines.append(
+            f"{st_name:<8} | {m_st['MSE']:<12.2f} | {m_st['MAE']:<10.2f} | {m_st['RMSE']:<11.2f} | "
+            f"{m_st['R2']:<8.3f} | {m_st['NSE']:<8.3f} | {m_st['KGE']:<8.3f} | "
+            f"{m_st['POD']:<7.3f} | {m_st['FAR']:<7.3f} | {m_st['CSI']:<7.3f}"
+        )
 
-        log_lines.append(f"📍 盲测站点【 {st_name:<4} 】| RMSE: {rmse:5.2f} mm/d | R²: {r2:5.3f} | CC: {cc:5.3f} | POD: {pod:4.2f} | FAR: {far:4.2f} | CSI: {csi:4.2f}")
-        log_lines.append(f"   └─► 湿润日专家权重占比: 资产1(微地形)={w1_avg:4.1f}% | 资产2(时空)={w2_avg:4.1f}% | 资产3(极值)={w3_avg:4.1f}%")
+    table2_lines.append("=" * 108)
+    table2_text = "\n".join(table2_lines)
 
-    avg_m = np.mean(metrics_list, axis=0)
-    log_lines.append("----------------------------------------------------------------------------------")
-    log_lines.append(f"🏆【全局 4 站平均】| RMSE: {avg_m[0]:5.2f} mm/d | R²: {avg_m[1]:5.3f} | CC: {avg_m[2]:5.3f} | POD: {avg_m[3]:4.2f} | FAR: {avg_m[4]:4.2f} | CSI: {avg_m[5]:4.2f}")
-    log_lines.append("==================================================================================")
+    # 打印至控制台
+    print(table1_text)
+    print(table2_text)
 
-    full_log_text = "\n".join(log_lines)
-    print("\n" + full_log_text)
-    
+    # 写入结果文本文件保存
+    full_output_log = table1_text + "\n" + table2_text + f"\n\nBest Val Loss: {best_val_loss:.4f}\n"
     with open(txt_result_path, "w", encoding="utf-8") as f:
-        f.write(full_log_text + "\n\nBest Val Loss: " + f"{best_val_loss:.4f}\n")
+        f.write(full_output_log)
+    print(f"\n📝 详细评估结果已同步保存至: {txt_result_path}")
 
+    # =========================================================================
+    # 💾 9. 全流域不规则边界掩膜与 NetCDF 导出
+    # =========================================================================
     p_fusion_arr[:, ~basin_mask_2d] = np.nan
     w1_arr[:, ~basin_mask_2d] = np.nan
     w2_arr[:, ~basin_mask_2d] = np.nan
@@ -414,12 +501,12 @@ def main():
             'lon': ds_gpm.lon
         },
         attrs={
-            'description': 'Strictly Water-Conserved Top-2 MOE Fusion System',
+            'description': 'Strictly Water-Conserved Top-2 MOE Fusion System (Train:2012-2019, Val:2020-2021, Test:2022-2024)',
             'spatial_mask': 'Clipped to irregular watershed boundary using DEM mask'
         }
     )
     ds_moe.to_netcdf(nc_moe_fusion_out)
-    print(f"🎉 NetCDF 导出完成: {nc_moe_fusion_out}")
+    print(f"🎉 全流域融合降水 NetCDF 导出完成: {nc_moe_fusion_out}")
 
 if __name__ == "__main__":
     main()
