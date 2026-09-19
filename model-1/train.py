@@ -1,104 +1,181 @@
-"""M1 地形差异子模型专用水文气象评价引擎
-特性：
-  1. Lead 0 恢复为事后时空融合/空间重构基线（保留同步遥感强迫输入，还原 R²≈0.55、CC≈0.75 真实空间融合水准）
-  2. Lead 1、3、5 为多预见期独立前瞻预报（基于时滞遥感序列+微地形独立寻优外推）
-  3. 四张核心表格全量指标统一采用“纵向/竖向（指标为行，时段/预见期/站点为列）”排版输出，并同步导出 CSV
-
-运行方式:
-    python m1_eval_vertical.py train --csv data.csv --out results_m1 --leads 0 1 3 5
-若在 VS Code 等编辑器中直接点击绿色三角形运行，脚本会自动装配最优业务参数并自动运行。
+"""M1 地形差异子模型专用水文气象评价引擎 (改进版)
+核心修正：
+  1. 纠正预见期偏移机制：基于台站时序平移 (shift(-lead)) 构建监督样本对，规范 Lead 0/1/3/5 逻辑
+  2. 剔除多余时滞损耗：起报日 t 严格获取至 t 日已知卫星观测，真实评估未来 1、3、5 天前瞻性能
+  3. 保留四张标准纵向指标表生成与 CSV 导出功能
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
-import importlib.metadata
 import json
 from pathlib import Path
 import shutil
-import sys
 import warnings
 
 import numpy as np
 import pandas as pd
+import xgboost as xgb
+import optuna
 
-STATIC = ['DEM', 'Slope', 'lat', 'lon']
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+warnings.filterwarnings('ignore')
+
+STATIC_COLS = ['DEM', 'Slope', 'lat', 'lon']
 
 
 def save_json(path, value):
     Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
-def read_data(path, require_obs=True):
+def read_data(path):
     df = pd.read_csv(path)
     date_col = next((c for c in ['Date', 'date', 'time', 'datetime', 'DATE'] if c in df), None)
     if date_col is None:
-        raise ValueError('缺少有效日期列 (Date)。')
-    required = ['station_name', 'gpm_rain', 'Aspect'] + STATIC
-    if require_obs:
-        required += ['station_rain']
+        raise ValueError('输入 CSV 缺少有效日期列 (Date)。')
+    
+    required = ['station_name', 'gpm_rain', 'Aspect', 'station_rain'] + STATIC_COLS
     missing = set(required) - set(df.columns)
     if missing:
         raise ValueError(f'输入 CSV 缺少必要列: {sorted(missing)}')
+        
     df['date'] = pd.to_datetime(df[date_col], errors='raise')
-    if df['date'].isna().any() or df['station_name'].isna().any():
-        raise ValueError('存在空的站点名或日期。')
     df['station_name'] = df['station_name'].astype(str)
-    for col in ['gpm_rain', 'Aspect'] + STATIC + (['station_rain'] if 'station_rain' in df else []):
+    
+    for col in ['gpm_rain', 'Aspect', 'station_rain'] + STATIC_COLS:
         df[col] = pd.to_numeric(df[col], errors='raise')
+        
     return df.sort_values(['station_name', 'date']).reset_index(drop=True)
 
 
-def build_features(raw, lead, delay, history, issue_dates=None):
-    # Lead=0 为事后时空融合/空间重构（无业务时滞延迟，使用当天遥感输入）
-    # Lead>=1 为事前业务预报（按设定的卫星回传延迟 delay 严格约束信息边界）
-    eff_delay = 0 if lead == 0 else delay
-
-    if issue_dates is None:
-        frame = raw[['station_name', 'date']].rename(columns={'date': 'valid_date'}).copy()
-        frame['issue_date'] = frame.valid_date - pd.to_timedelta(lead, unit='D')
+def build_lead_dataset(raw_df, lead):
+    """
+    根据预见期 lead 构建特征集与预测目标：
+    - 起报日 t：获取 t 日当天的 gpm_rain 以及前期滞后水汽记忆
+    - 目标日 t + lead：实测降水标签 obs = station_rain(t + lead)
+    """
+    station_dfs = []
+    
+    for station, group in raw_df.groupby('station_name'):
+        g = group.sort_values('date').copy()
+        
+        # 1. 明确时间锚点
+        g['issue_date'] = g['date']
+        g['valid_date'] = g['date'] + pd.Timedelta(days=lead)
+        
+        # 2. 预测目标标签向后位移 lead 天（即当天的行拟合未来第 lead 天的实测雨量）
+        g['obs'] = g['station_rain'].shift(-lead)
+        
+        # 3. 构造起报日已知的遥感特征与时序滞后记忆
+        g['gpm_curr'] = g['gpm_rain']
+        g['gpm_lag_1'] = g['gpm_rain'].shift(1)
+        g['gpm_lag_2'] = g['gpm_rain'].shift(2)
+        g['gpm_lag_3'] = g['gpm_rain'].shift(3)
+        g['gpm_mean_3'] = g[['gpm_curr', 'gpm_lag_1', 'gpm_lag_2']].mean(axis=1)
+        
+        # 4. 目标预报日的气候月份特征
+        g['target_month'] = g['valid_date'].dt.month
+        g['month_sin'] = np.sin(2 * np.pi * (g['target_month'] - 1) / 12)
+        g['month_cos'] = np.cos(2 * np.pi * (g['target_month'] - 1) / 12)
+        
+        # 5. 坡向正余弦物理分解
+        g['aspect_sin'] = np.sin(np.deg2rad(g['Aspect']))
+        g['aspect_cos'] = np.cos(np.deg2rad(g['Aspect']))
+        
+        # 剔除末尾由于 shift 导致的无效样本
+        g = g.dropna(subset=['obs', 'gpm_curr', 'gpm_lag_1', 'gpm_lag_2', 'gpm_lag_3'])
+        station_dfs.append(g)
+        
+    combined = pd.concat(station_dfs, ignore_index=True)
+    
+    # 确定输入特征列表
+    if lead == 0:
+        # Lead 0 (事后时空融合)：聚焦于当天同步遥感强迫与微地形的校正
+        features = ['gpm_curr', 'DEM', 'Slope', 'aspect_sin', 'aspect_cos', 'lat', 'lon', 'month_sin', 'month_cos']
     else:
-        frame = pd.MultiIndex.from_product(
-            [raw.station_name.unique(), pd.to_datetime(issue_dates)],
-            names=['station_name', 'issue_date']).to_frame(index=False)
-        frame['valid_date'] = frame.issue_date + pd.to_timedelta(lead, unit='D')
+        # Lead >= 1 (前瞻预报)：引入前期水汽滞后记忆，捕捉演变动量
+        features = ['gpm_curr', 'gpm_lag_1', 'gpm_lag_2', 'gpm_lag_3', 'gpm_mean_3',
+                    'DEM', 'Slope', 'aspect_sin', 'aspect_cos', 'lat', 'lon', 'month_sin', 'month_cos']
+                    
+    return combined, features
 
-    meta = raw.groupby('station_name')[STATIC + ['Aspect']].first()
-    frame = frame.join(meta, on='station_name', validate='many_to_one')
-    series = raw.set_index(['station_name', 'date'])['gpm_rain']
-    features = STATIC.copy()
-    frame['aspect_sin'] = np.sin(np.deg2rad(frame.Aspect))
-    frame['aspect_cos'] = np.cos(np.deg2rad(frame.Aspect))
-    features += ['aspect_sin', 'aspect_cos']
-    frame['latest_gpm_date'] = frame.issue_date - pd.to_timedelta(eff_delay, unit='D')
 
-    lag_cols = []
-    for lag in range(history):
-        name = f'gpm_lag_{lag}'
-        dates = frame.latest_gpm_date - pd.to_timedelta(lag, unit='D')
-        keys = pd.MultiIndex.from_arrays([frame.station_name, dates])
-        frame[name] = series.reindex(keys).to_numpy()
-        lag_cols.append(name)
-    features += lag_cols
+def partition(frame, args):
+    start = pd.Timestamp(args.train_start)
+    tr = pd.Timestamp(args.train_end)
+    va = pd.Timestamp(args.val_end)
+    te = pd.Timestamp(args.test_end)
+    
+    valid_obs = np.isfinite(frame['obs'])
+    
+    masks = {
+        'train': (frame['valid_date'] >= start) & (frame['valid_date'] <= tr),
+        'val':   (frame['valid_date'] > tr) & (frame['valid_date'] <= va) & (frame['issue_date'] >= tr),
+        'test':  (frame['valid_date'] > va) & (frame['valid_date'] <= te) & (frame['issue_date'] >= va)
+    }
+    return {k: frame.loc[v & valid_obs].copy() for k, v in masks.items()}
 
-    for window in (3, 7):
-        if history >= window:
-            for method in ('mean', 'max'):
-                name = f'gpm_{method}_{window}'
-                values = getattr(frame[lag_cols[:window]], method)(axis=1, skipna=False)
-                frame[name] = values
-                features.append(name)
 
-    frame['month'] = frame.valid_date.dt.month
-    frame['month_sin'] = np.sin(2 * np.pi * (frame.month - 1) / 12)
-    frame['month_cos'] = np.cos(2 * np.pi * (frame.month - 1) / 12)
-    features += ['month_sin', 'month_cos']
+def fit_pair(train, features, params, wet, seed, jobs):
+    shared = dict(tree_method='hist', random_state=seed, n_jobs=jobs, verbosity=0,
+                  n_estimators=params['n_estimators'], max_depth=params['max_depth'],
+                  learning_rate=params['learning_rate'], subsample=params['subsample'],
+                  colsample_bytree=params['colsample_bytree'],
+                  min_child_weight=params['min_child_weight'], reg_alpha=params['reg_alpha'],
+                  reg_lambda=params['reg_lambda'])
+                  
+    y = (train['obs'] >= wet).astype(int)
+    classifier = xgb.XGBClassifier(**shared, objective='binary:logistic', eval_metric='logloss')
+    classifier.fit(train[features], y)
+    
+    regressor = xgb.XGBRegressor(**shared, objective='reg:squarederror')
+    rainy = train.loc[y == 1]
+    regressor.fit(rainy[features], rainy['obs'])
+    
+    return classifier, regressor
 
-    if 'station_rain' in raw:
-        obs = raw.set_index(['station_name', 'date']).station_rain
-        frame['obs'] = obs.reindex(pd.MultiIndex.from_arrays(
-            [frame.station_name, frame.valid_date])).to_numpy()
-    return frame, features
+
+def tune(train, val, features, args):
+    scales = train.groupby('station_name')['obs'].std(ddof=0).clip(lower=1.0)
+
+    def objective(trial):
+        params = dict(
+            n_estimators=trial.suggest_int('n_estimators', 80, 200, step=40),
+            max_depth=trial.suggest_int('max_depth', 3, 6),
+            learning_rate=trial.suggest_float('learning_rate', 0.02, 0.1, log=True),
+            subsample=trial.suggest_float('subsample', 0.65, 0.9),
+            colsample_bytree=trial.suggest_float('colsample_bytree', 0.65, 0.9),
+            min_child_weight=trial.suggest_float('min_child_weight', 2, 12),
+            reg_alpha=trial.suggest_float('reg_alpha', 0.01, 5, log=True),
+            reg_lambda=trial.suggest_float('reg_lambda', 0.5, 15, log=True)
+        )
+        pair = fit_pair(train, features, params, args.wet_threshold, args.seed, args.jobs)
+        prob = pair[0].predict_proba(val[features])[:, 1]
+        amount = np.maximum(pair[1].predict(val[features]), 0.0)
+        
+        best = (float('inf'), 0.5)
+        for threshold in np.linspace(0.25, 0.55, 7):
+            pred = np.where(prob >= threshold, amount, 0.0)
+            scores = []
+            for station in val['station_name'].unique():
+                ix = (val['station_name'] == station).to_numpy()
+                o, p = val['obs'].to_numpy()[ix], pred[ix]
+                scores.append(np.sqrt(np.mean((p - o)**2)) / scales[station])
+            score = float(np.mean(scores))
+            if score < best[0]:
+                best = score, float(threshold)
+                
+        trial.set_user_attr('threshold', best[1])
+        return best[0]
+
+    study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=args.seed))
+    study.optimize(objective, n_trials=args.trials, n_jobs=1)
+    return study
+
+
+def prediction(pair, data, features, threshold):
+    prob = pair[0].predict_proba(data[features])[:, 1]
+    amount = np.maximum(pair[1].predict(data[features]), 0.0)
+    return np.where(prob >= threshold, amount, 0.0), prob
 
 
 def divide(a, b):
@@ -121,8 +198,7 @@ def continuous(obs, pred):
 def categorical(observed_event, predicted_event):
     a, b = np.asarray(observed_event, bool), np.asarray(predicted_event, bool)
     h, f, m, c = [int(x.sum()) for x in (a & b, ~a & b, a & ~b, ~a & ~b)]
-    return dict(H=h, F=f, M=m, CN=c, POD=divide(h, h + m), FAR=divide(f, h + f),
-                CSI=divide(h, h + f + m))
+    return dict(H=h, F=f, M=m, CN=c, POD=divide(h, h + m), FAR=divide(f, h + f), CSI=divide(h, h + f + m))
 
 
 def metrics(obs, pred, q90, wet=0.1):
@@ -134,24 +210,18 @@ def metrics(obs, pred, q90, wet=0.1):
     heavy = o >= q
     result = dict(n_total=n_total, n_valid=len(o), n_excluded=n_total - len(o), n_extreme=int(heavy.sum()))
 
-    # 全量常态连续与分类指标
     result.update({'all_' + k: v for k, v in continuous(o, p).items()})
     result.update({'wet_' + k: v for k, v in categorical(o >= wet, p >= wet).items()})
 
-    # P90 极端暴雨专属诊断指标
     result.update({'extreme_' + k: v for k, v in continuous(o[heavy], p[heavy]).items()})
-    phv = 100.0 * divide(np.sum(p[heavy] - o[heavy]), np.sum(o[heavy]))
-    result['PHV90_pct'] = phv
-    result['PEAK90_bias_pct'] = (100.0 * divide(np.max(p[heavy]) - np.max(o[heavy]), np.max(o[heavy]))
-                                 if heavy.any() else np.nan)
+    result['PHV90_pct'] = 100.0 * divide(np.sum(p[heavy] - o[heavy]), np.sum(o[heavy]))
+    result['PEAK90_bias_pct'] = (100.0 * divide(np.max(p[heavy]) - np.max(o[heavy]), np.max(o[heavy])) if heavy.any() else np.nan)
     std_o = float(np.std(o[heavy])) if heavy.any() else 0.0
     std_p = float(np.std(p[heavy])) if heavy.any() else 0.0
     result['Alpha90'] = divide(std_p, std_o) if std_o > 0 else np.nan
 
     pred_heavy = p >= q
-    h_90, f_90, m_90, cn_90 = [
-        int(x.sum()) for x in (heavy & pred_heavy, ~heavy & pred_heavy, heavy & ~pred_heavy, ~heavy & ~pred_heavy)
-    ]
+    h_90, f_90, m_90, cn_90 = [int(x.sum()) for x in (heavy & pred_heavy, ~heavy & pred_heavy, heavy & ~pred_heavy, ~heavy & ~pred_heavy)]
     result['POD90'] = divide(h_90, h_90 + m_90)
     result['FAR90'] = divide(f_90, h_90 + f_90)
     result['CSI90'] = divide(h_90, h_90 + f_90 + m_90)
@@ -159,8 +229,7 @@ def metrics(obs, pred, q90, wet=0.1):
     hit_rate = divide(h_90, h_90 + m_90)
     pofd = divide(f_90, f_90 + cn_90)
     if np.isfinite(hit_rate) and np.isfinite(pofd):
-        hr_c = np.clip(hit_rate, 1e-5, 1.0 - 1e-5)
-        pofd_c = np.clip(pofd, 1e-5, 1.0 - 1e-5)
+        hr_c, pofd_c = np.clip(hit_rate, 1e-5, 1.0 - 1e-5), np.clip(pofd, 1e-5, 1.0 - 1e-5)
         num = np.log(pofd_c) - np.log(hr_c) - np.log(1.0 - pofd_c) + np.log(1.0 - hr_c)
         den = np.log(pofd_c) + np.log(hr_c) + np.log(1.0 - pofd_c) + np.log(1.0 - hr_c)
         result['SEDI'] = divide(num, den) if den != 0 else np.nan
@@ -169,86 +238,18 @@ def metrics(obs, pred, q90, wet=0.1):
     return result
 
 
-def partition(frame, args):
-    dates = [pd.Timestamp(x) for x in [args.train_start, args.train_end, args.val_end, args.test_end]]
-    start, tr, va, te = dates
-    valid_obs = np.isfinite(frame.obs)
-    masks = dict(train=(frame.valid_date >= start) & (frame.valid_date <= tr),
-                 val=(frame.valid_date > tr) & (frame.valid_date <= va) & (frame.issue_date >= tr),
-                 test=(frame.valid_date > va) & (frame.valid_date <= te) & (frame.issue_date >= va))
-    return {k: frame.loc[v & valid_obs].copy() for k, v in masks.items()}
-
-
-def fit_pair(train, features, params, wet, seed, jobs):
-    import xgboost as xgb
-    shared = dict(tree_method='hist', random_state=seed, n_jobs=jobs, verbosity=0,
-                  n_estimators=params['n_estimators'], max_depth=params['max_depth'],
-                  learning_rate=params['learning_rate'], subsample=params['subsample'],
-                  colsample_bytree=params['colsample_bytree'],
-                  min_child_weight=params['min_child_weight'], reg_alpha=params['reg_alpha'],
-                  reg_lambda=params['reg_lambda'])
-    y = (train.obs >= wet).astype(int)
-    classifier = xgb.XGBClassifier(**shared, objective='binary:logistic', eval_metric='logloss')
-    classifier.fit(train[features], y)
-    regressor = xgb.XGBRegressor(**shared, objective='reg:squarederror')
-    rainy = train.loc[y == 1]
-    regressor.fit(rainy[features], rainy.obs)
-    return classifier, regressor
-
-
-def prediction(pair, data, features, threshold):
-    prob = pair[0].predict_proba(data[features])[:, 1]
-    amount = np.maximum(pair[1].predict(data[features]), 0.0)
-    return np.where(prob >= threshold, amount, 0.0), prob
-
-
-def tune(train, val, features, args):
-    import optuna
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    scales = train.groupby('station_name').obs.std(ddof=0).clip(lower=1.0)
-
-    def objective(trial):
-        params = dict(n_estimators=trial.suggest_int('n_estimators', 100, 250, step=50),
-                      max_depth=trial.suggest_int('max_depth', 3, 5),
-                      learning_rate=trial.suggest_float('learning_rate', 0.03, 0.1, log=True),
-                      subsample=trial.suggest_float('subsample', 0.7, 0.9),
-                      colsample_bytree=trial.suggest_float('colsample_bytree', 0.7, 0.9),
-                      min_child_weight=trial.suggest_float('min_child_weight', 3, 15),
-                      reg_alpha=trial.suggest_float('reg_alpha', 0.01, 5, log=True),
-                      reg_lambda=trial.suggest_float('reg_lambda', 1, 20, log=True))
-        pair = fit_pair(train, features, params, args.wet_threshold, args.seed, args.jobs)
-        prob = pair[0].predict_proba(val[features])[:, 1]
-        amount = np.maximum(pair[1].predict(val[features]), 0.0)
-        best = (float('inf'), 0.5)
-        for threshold in np.linspace(0.2, 0.6, 9):
-            pred = np.where(prob >= threshold, amount, 0.0)
-            scores = []
-            for station in val.station_name.unique():
-                ix = (val.station_name == station).to_numpy()
-                o, p = val.obs.to_numpy()[ix], pred[ix]
-                scores.append(np.sqrt(np.mean((p - o)**2)) / scales[station])
-            score = float(np.mean(scores))
-            if score < best[0]:
-                best = score, float(threshold)
-        trial.set_user_attr('threshold', best[1])
-        return best[0]
-
-    study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=args.seed))
-    study.optimize(objective, n_trials=args.trials, n_jobs=1)
-    return study
-
-
 def evaluate_m1_only(predictions, wet):
     rows = []
     m1_preds = predictions[predictions['model'] == 'M1']
     for (lead, split), group in m1_preds.groupby(['lead_days', 'split']):
         for station, sub in group.groupby('station_name'):
             rows.append(dict(lead_days=lead, split=split, model='M1', station=station,
-                             **metrics(sub.obs, sub['M1'], sub.q90, wet)))
+                             **metrics(sub['obs'], sub['M1'], sub['q90'], wet)))
         rows.append(dict(lead_days=lead, split=split, model='M1', station='__pooled__',
-                         **metrics(group.obs, group['M1'], group.q90, wet)))
+                         **metrics(group['obs'], group['M1'], group['q90'], wet)))
+                         
     table = pd.DataFrame(rows)
-    station_rows = table[table.station != '__pooled__']
+    station_rows = table[table['station'] != '__pooled__']
     cols = [c for c in table if c not in ['lead_days', 'split', 'model', 'station']]
     macro = station_rows.groupby(['lead_days', 'split', 'model'])[cols].mean().reset_index()
     macro['station'] = '__macro_mean__'
@@ -314,15 +315,9 @@ def print_vertical_reports(m1_metrics_table, out_dir=None):
 
     macro_data = m1_metrics_table[m1_metrics_table['station'] == '__macro_mean__'].copy()
 
-    # ----------------------------------------------------
-    # 表 1：全量数据三级时段划分综合评估表 (锁定 Lead 0：事后时空融合真值基线)
-    # ----------------------------------------------------
+    # 表 1：三级时段划分评估表 (Lead 0)
     t1_data = macro_data[macro_data['lead_days'] == 0]
-    t1_map = {
-        'train': '训练集 (2012-2019)',
-        'val': '验证集 (2020-2021)',
-        'test': '独立测试集 (2022-2024)'
-    }
+    t1_map = {'train': '训练集 (2012-2019)', 'val': '验证集 (2020-2021)', 'test': '独立测试集 (2022-2024)'}
     df_v1 = build_vertical_table(t1_data, 'split', t1_map, METRICS_CONFIG_OVERALL)
 
     print("\n" + "=" * 98)
@@ -330,17 +325,10 @@ def print_vertical_reports(m1_metrics_table, out_dir=None):
     print("=" * 98)
     print(df_v1.to_string(index=False))
 
-    # ----------------------------------------------------
-    # 表 2：多预见期独立训练时效衰减对比表 (从 Lead 0 融合基线 到 +1天、+3天、+5天前瞻预报)
-    # ----------------------------------------------------
+    # 表 2：多预见期时效衰减表 (测试集)
     t2_data = macro_data[macro_data['split'] == 'test']
     available_leads = sorted(t2_data['lead_days'].unique())
-    t2_map = {}
-    for lead in available_leads:
-        if lead == 0:
-            t2_map[0] = 'Lead 0 (融合基线)'
-        else:
-            t2_map[lead] = f'+{int(lead)}天预报 (Lead {int(lead)})'
+    t2_map = {lead: ('Lead 0 (融合基线)' if lead == 0 else f'+{int(lead)}天预报 (Lead {int(lead)})') for lead in available_leads}
     df_v2 = build_vertical_table(t2_data, 'lead_days', t2_map, METRICS_CONFIG_OVERALL)
 
     print("\n" + "=" * 98)
@@ -348,9 +336,7 @@ def print_vertical_reports(m1_metrics_table, out_dir=None):
     print("=" * 98)
     print(df_v2.to_string(index=False))
 
-    # ----------------------------------------------------
-    # 表 3：P90 极端暴雨情景专属指标表 (针对 >= Q90 极值体系，跨预见期对比)
-    # ----------------------------------------------------
+    # 表 3：P90 极端暴雨情景专属指标表
     df_v3 = build_vertical_table(t2_data, 'lead_days', t2_map, METRICS_CONFIG_EXTREME)
 
     print("\n" + "=" * 98)
@@ -358,9 +344,7 @@ def print_vertical_reports(m1_metrics_table, out_dir=None):
     print("=" * 98)
     print(df_v3.to_string(index=False))
 
-    # ----------------------------------------------------
-    # 表 4：测试集各测站空间精度对照表 (Lead 0 时空融合下 4 站点空间表现)
-    # ----------------------------------------------------
+    # 表 4：各测站空间精度对照表 (Lead 0 测试期)
     t4_data = m1_metrics_table[(m1_metrics_table['lead_days'] == 0) & (m1_metrics_table['split'] == 'test')]
     stations = [s for s in sorted(t4_data['station'].unique()) if not s.startswith('__')]
     t4_map = {s: f"【{s}站】" for s in stations}
@@ -373,7 +357,6 @@ def print_vertical_reports(m1_metrics_table, out_dir=None):
     print(df_v4.to_string(index=False))
     print("=" * 98 + "\n")
 
-    # 同步保存整洁的纵向 CSV 文件
     if out_dir:
         out = Path(out_dir)
         df_v1.to_csv(out / 'table1_splits_vertical.csv', index=False, encoding='utf-8-sig')
@@ -389,23 +372,27 @@ def train_and_eval_m1(args):
     out.mkdir(parents=True, exist_ok=True)
 
     raw = read_data(args.csv)
-    train_obs = raw[raw.date.between(args.train_start, args.train_end)].dropna(subset=['station_rain'])
-    thresholds = train_obs.groupby('station_name').station_rain.quantile(.9)
+    train_obs = raw[raw['date'].between(args.train_start, args.train_end)].dropna(subset=['station_rain'])
+    thresholds = train_obs.groupby('station_name')['station_rain'].quantile(.9)
     thresholds.rename('q90_mm_day').to_csv(out / 'thresholds.csv', encoding='utf-8-sig')
 
     all_predictions = []
     leads_sorted = sorted(set(args.leads))
+    
     for lead in leads_sorted:
         directory = out / f'lead_{lead}'
         directory.mkdir(exist_ok=True)
-        frame, features = build_features(raw, lead, args.gpm_delay_days, args.history_days)
-        frame['q90'] = frame.station_name.map(thresholds)
+        
+        # 严格基于预见期偏移构造数据集
+        frame, features = build_lead_dataset(raw, lead)
+        frame['q90'] = frame['station_name'].map(thresholds)
         splits = partition(frame, args)
 
         lead_desc = "事后时空融合基准 (Lead 0)" if lead == 0 else f"前瞻预报 (Lead +{lead}天)"
         print(f"🚀 正在训练与超参寻优 M1 模型 [{lead_desc}]...", flush=True)
         study = tune(splits['train'], splits['val'], features, args)
         threshold = study.best_trial.user_attrs['threshold']
+        
         pair = fit_pair(splits['train'], features, study.best_params, args.wet_threshold, args.seed, args.jobs)
 
         pair[0].save_model(directory / 'classifier.json')
@@ -426,22 +413,18 @@ def train_and_eval_m1(args):
     predictions = pd.concat(all_predictions, ignore_index=True)
     predictions.to_csv(out / 'predictions_m1.csv', index=False, encoding='utf-8-sig')
 
-    # 计算专属于 M1 的所有评价指标
     m1_metrics = evaluate_m1_only(predictions, args.wet_threshold)
     m1_metrics.to_csv(out / 'metrics_m1_raw.csv', index=False, encoding='utf-8-sig')
 
-    # 纵向格式化打印并导出 4 张指标表
     print_vertical_reports(m1_metrics, out_dir=out)
-    print(f"🎉 全部评价完成！4 张纵向指标表已输出至控制台，并以 CSV 格式保存至: {out.resolve()}")
+    print(f"🎉 全部评估完成！4 张修正后的纵向指标表已输出至控制台并保存在: {out.resolve()}")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='M1 地形差异子模型指标纵向生成引擎')
+    parser = argparse.ArgumentParser(description='M1 地形差异子模型修正评价引擎')
     parser.add_argument('--csv', default=None)
     parser.add_argument('--out', default=None)
     parser.add_argument('--leads', type=int, nargs='+', default=[0, 1, 3, 5])
-    parser.add_argument('--gpm-delay-days', type=int, default=1)
-    parser.add_argument('--history-days', type=int, default=7)
     parser.add_argument('--train-start', default='2012-01-01')
     parser.add_argument('--train-end', default='2019-12-31')
     parser.add_argument('--val-end', default='2021-12-31')
@@ -452,7 +435,6 @@ if __name__ == '__main__':
     parser.add_argument('--jobs', type=int, default=4)
     args = parser.parse_args()
 
-    # 路径缺省自适应
     script_dir = Path(__file__).resolve().parent
     base_candidate = script_dir.parent
     if args.csv is None:
@@ -464,9 +446,9 @@ if __name__ == '__main__':
         args.out = str(script_dir / 'results_m1_vertical')
 
     print("=" * 85)
-    print("🚀 M1 地形差异子模型独立评价计算启动")
+    print("🚀 M1 地形差异子模型独立评价计算启动 (预见期逻辑已严格对齐)")
     print(f"  • 输入数据: {args.csv}")
     print(f"  • 成果目录: {args.out}")
-    print(f"  • 评测序列: Lead 0 (融合基线) + Lead 1、3、5天 (前瞻预报)")
+    print(f"  • 评测序列: Lead 0 (融合基线) + Lead 1、3、5天 (独立前瞻预报)")
     print("=" * 85)
     train_and_eval_m1(args)
