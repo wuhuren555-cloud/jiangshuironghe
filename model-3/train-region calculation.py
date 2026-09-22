@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
 
 # =========================================================================
 # 🔒 1. 锁死全局随机种子 (确保 100% 可复现)
@@ -24,7 +25,7 @@ def seed_everything(seed=42):
 
 seed_everything(42)
 
-# 设置站点极值分位数 (取历史 90% 分位数 P90 作为该站极值门槛)
+# 设置站点极值分位数 (取训练期历史 90% 分位数 P90 作为该站专属极值门槛)
 EXTREME_QUANTILE = 0.90 
 
 # =========================================================================
@@ -48,14 +49,17 @@ save_model_dir = os.path.join(base_dir, "极值降水子模型")
 os.makedirs(save_model_dir, exist_ok=True)
 pth_model_path = os.path.join(save_model_dir, "best_ea_resnet_asset3.pth")
 
-txt_result_path = os.path.join(base_dir, "三-降雨极值子模型", "结果.txt")
+txt_result_path = os.path.join(base_dir, "三-降雨极值子模型", "结果_三集极值.txt")
 nc_asset3_out   = os.path.join(base_dir, "wanggeshuju", "juxing_asset3_2012_2024.nc")
+
+save_fig_dir = os.path.join(base_dir, "绘图", "模型3-极值模型")
+os.makedirs(save_fig_dir, exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"⚡ 计算设备: {DEVICE}")
 
 # =========================================================================
-# 🏗️ 3. 改进版：双向残差 PINeuralGPDNet 与 Huber 极值 Loss
+# 🏗️ 3. 神经网络结构定义 (EA-ResNet + 双向残差修正)
 # =========================================================================
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=8):
@@ -109,7 +113,6 @@ class DilatedResBlock(nn.Module):
         return self.relu(out)
 
 class PINeuralGPDNet(nn.Module):
-    """【双向残差极值网络】：支持正向增雨与负向削降包络，并采用零初始化"""
     def __init__(self, in_channels=28, out_channels=1):
         super().__init__()
         self.in_conv = nn.Sequential(
@@ -124,10 +127,8 @@ class PINeuralGPDNet(nn.Module):
         self.out_conv = nn.Sequential(
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(32, out_channels, kernel_size=1) # 允许自由正负残差输出
+            nn.Conv2d(32, out_channels, kernel_size=1)
         )
-        
-        # 零初始化：使模型初始输出 Delta=0，训练起点稳定锚定在 GPM 上
         nn.init.zeros_(self.out_conv[-1].weight)
         nn.init.zeros_(self.out_conv[-1].bias)
 
@@ -136,13 +137,11 @@ class PINeuralGPDNet(nn.Module):
         feat = self.block1(feat)
         feat = self.block2(feat)
         feat = self.block3(feat)
-        delta_p = self.out_conv(feat) # 双向残差 Delta P
-        
-        # 物理输出：支持双向增减，最终以 ReLU 保证整体非负产雨
+        delta_p = self.out_conv(feat)
         return F.relu(gpm_base + delta_p)
 
 class StationQuantileExtremeLoss(nn.Module):
-    """【自适应 Huber 极值 Loss】：平滑大残差，非对称惩罚极值低估"""
+    """自适应 Huber 极值 Loss：严格只对超过该站专属 P90 门槛的样本计算梯度"""
     def __init__(self, delta=5.0):
         super().__init__()
         self.delta = delta
@@ -155,44 +154,61 @@ class StationQuantileExtremeLoss(nn.Module):
         err = target - pred
         abs_err = torch.abs(err)
         
-        # Huber 损失计算
         huber_loss = torch.where(
             abs_err <= self.delta,
             0.5 * (err ** 2),
             self.delta * abs_err - 0.5 * (self.delta ** 2)
         )
-        
-        # 非对称物理权重：对“低估暴雨”施加 1.3 倍惩罚
         asym_loss = torch.where(err > 0, 1.3 * huber_loss, huber_loss)
         masked_loss = asym_loss * extreme_mask
-        
         return torch.sum(masked_loss) / (valid_count + 1e-8)
 
 # =========================================================================
-# 📊 4. 评估指标计算函数
+# 📊 4. 纯极值指标结算函数 (考核范围完全限定在实测 >= P90 样本)
 # =========================================================================
-def calc_metrics_quantile(obs, pred, threshold):
+def calc_pure_extreme_metrics(obs, pred, threshold):
+    """
+    仅对实测 obs >= threshold 的暴雨极值样本计算指标：
+    MAE, MSE, RMSE, R2, NSE, KGE, CC, POD, FAR, CSI
+    """
+    obs = np.array(obs, dtype=np.float64)
+    pred = np.array(pred, dtype=np.float64)
+    
+    # 严格过滤极值样本子集
     ext_mask = ~np.isnan(obs) & ~np.isnan(pred) & (obs >= threshold)
     o, p = obs[ext_mask], pred[ext_mask]
     
     if len(o) < 3:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        return [0.0] * 10
 
-    rmse = np.sqrt(np.mean((p - o) ** 2))
-    ss_res = np.sum((o - p) ** 2)
-    ss_tot = np.sum((o - np.mean(o)) ** 2)
-    r2 = 1.0 - (ss_res / (ss_tot + 1e-8)) if ss_tot > 1e-6 else 0.0
-    cc = np.corrcoef(o, p)[0, 1] if (np.std(o) > 1e-6 and np.std(p) > 1e-6) else 0.0
+    mae = float(np.mean(np.abs(p - o)))
+    mse = float(np.mean((p - o) ** 2))
+    rmse = float(np.sqrt(mse))
+    
+    ss_res = float(np.sum((o - p) ** 2))
+    ss_tot = float(np.sum((o - np.mean(o)) ** 2))
+    r2 = float(1.0 - (ss_res / (ss_tot + 1e-8))) if ss_tot > 1e-6 else 0.0
+    nse = r2
+    
+    if np.std(o) > 1e-6 and np.std(p) > 1e-6:
+        cc = float(np.corrcoef(o, p)[0, 1])
+    else:
+        cc = 0.0
+        
+    alpha = float(np.std(p) / (np.std(o) + 1e-8))
+    beta  = float(np.mean(p) / (np.mean(o) + 1e-8))
+    kge   = float(1.0 - np.sqrt((cc - 1.0)**2 + (alpha - 1.0)**2 + (beta - 1.0)**2))
 
-    hits = np.sum((o >= threshold) & (p >= threshold))
-    misses = np.sum((o >= threshold) & (p < threshold))
-    false_alarms = np.sum((o < threshold) & (p >= threshold))
+    # 在极值事件样本池内评估预警判定
+    hits = float(np.sum(p >= threshold))
+    misses = float(np.sum(p < threshold))
+    false_alarms = float(np.sum(o < threshold))  # 极值子集内所有样本均满足 o >= threshold，此处恒为 0
 
-    pod = hits / (hits + misses + 1e-8)
-    far = false_alarms / (hits + false_alarms + 1e-8)
-    csi = hits / (hits + misses + false_alarms + 1e-8)
+    pod = float(hits / (hits + misses + 1e-8))
+    far = float(false_alarms / (hits + false_alarms + 1e-8))
+    csi = float(hits / (hits + misses + false_alarms + 1e-8))
 
-    return rmse, r2, cc, pod, far, csi
+    return [mae, mse, rmse, r2, nse, kge, cc, pod, far, csi]
 
 # =========================================================================
 # 📦 5. 数据集定义
@@ -229,11 +245,47 @@ class ExtremePrecipDataset(Dataset):
         return x_3days, gpm_base, self.target[t], self.extreme_mask[t]
 
 # =========================================================================
-# 🚀 6. 主训练与评估程序
+# 🎨 6. 学术三线表图像渲染与保存函数
+# =========================================================================
+def render_table_to_png(df, title, save_path, figsize=(10.5, 4.5)):
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    
+    fig, ax = plt.subplots(figsize=figsize, dpi=300)
+    ax.axis('off')
+    
+    table = ax.table(
+        cellText=df.values,
+        colLabels=df.columns,
+        cellLoc='center',
+        loc='center'
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9.5)
+    table.scale(1.0, 1.8)
+    
+    for col_idx in range(len(df.columns)):
+        cell = table[0, col_idx]
+        cell.set_facecolor('#2b5c8f')
+        cell.set_text_props(color='white', weight='bold')
+    
+    for row_idx in range(1, len(df) + 1):
+        bg_color = '#f8f9fa' if row_idx % 2 == 0 else '#ffffff'
+        for col_idx in range(len(df.columns)):
+            table[row_idx, col_idx].set_facecolor(bg_color)
+            
+    plt.title(title, fontsize=13, fontweight='bold', pad=15)
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches='tight')
+    plt.close()
+    print(f"📊 学术表格已生成: {save_path}")
+
+# =========================================================================
+# 🚀 7. 主程序：极值训练、三集极值评估与全矩阵资产导出
 # =========================================================================
 def main():
     print("=" * 75)
-    print(f"🔥 构建【资产 3：双向残差+零初始化 各站 P{int(EXTREME_QUANTILE*100)} 极值专家】...")
+    print("🔥 构建【资产 3：训练(2012-2019)/验证(2020-2021)/测试(2022-2024) 纯P90极值模型】...")
 
     ds_gpm = xr.open_dataset(nc_path, engine="netcdf4").sel(time=slice("2012-01-01", "2024-12-31"))
     times, lats, lons = ds_gpm.time.values, ds_gpm.lat.values, ds_gpm.lon.values
@@ -242,7 +294,6 @@ def main():
     gpm_tensor = torch.tensor(gpm_arr, dtype=torch.float32).unsqueeze(1)
     num_days, _, H, W = gpm_tensor.shape
 
-    # 流域边界模板读取
     match_template = ds_gpm['precipitation'].rename({"lon": "x", "lat": "y"}).rio.write_crs("EPSG:4326")
     da_dem = rioxarray.open_rasterio(dem_tif).rio.reproject_match(match_template)
     raw_dem_arr = da_dem.values[0]
@@ -251,7 +302,6 @@ def main():
     dem_norm = (dem_arr_clean - dem_arr_clean.mean()) / (dem_arr_clean.std() + 1e-6)
     dem_tensor = torch.tensor(dem_norm, dtype=torch.float32).unsqueeze(0)
 
-    # 对齐 5通道 气象场与 2通道 极值特征
     era5_met = torch.load(era5_met_pt_path)
     era5_full_dates = pd.date_range("2012-01-01", "2024-12-31").strftime('%Y-%m-%d')
     era5_date_map = {d: i for i, d in enumerate(era5_full_dates)}
@@ -266,7 +316,6 @@ def main():
     if era5_ext.shape[0] != num_days:
         era5_ext = era5_ext[:num_days]
 
-    # 实测数据与 P90 动态门槛计算
     df_station = pd.read_csv(station_csv_path)
     df_station['date'] = pd.to_datetime(df_station['date'])
     date_to_idx = {pd.Timestamp(d).strftime('%Y-%m-%d'): i for i, d in enumerate(times)}
@@ -275,7 +324,7 @@ def main():
     station_coords = {}
     station_p90_thresholds = {}
 
-    print("\n📊 各站点 2012-2019 年历史降水 P90 极值专属门槛:")
+    print("\n📊 各站点 2012–2019 训练基准期专属 P90 门槛:")
     print("-" * 65)
 
     for _, row in df_station[['station_name', 'lat', 'lon']].drop_duplicates().iterrows():
@@ -288,7 +337,8 @@ def main():
         for _, d_row in st_data.iterrows():
             d_str = d_row['date'].strftime('%Y-%m-%d')
             if d_str in date_to_idx:
-                station_target[date_to_idx[d_str], 0, r_idx, c_idx] = float(d_row['station_rain'])
+                t_idx = date_to_idx[d_str]
+                station_target[t_idx, 0, r_idx, c_idx] = float(d_row['station_rain'])
         
         train_st_rain = st_data[st_data['date'] < '2020-01-01']['station_rain'].values
         p90_val = float(np.percentile(train_st_rain, EXTREME_QUANTILE * 100))
@@ -297,21 +347,24 @@ def main():
 
     print("-" * 65)
 
+    # 构建 4D 动态极值掩膜矩阵 (仅实测 >= P90 为 1.0)
     extreme_mask_4d = torch.zeros((num_days, 1, H, W), dtype=torch.float32)
     for st_name, (r_idx, c_idx) in station_coords.items():
         st_thresh = station_p90_thresholds[st_name]
-        st_rain_series = station_target[:, 0, r_idx, c_idx]
-        is_extreme = (st_rain_series >= st_thresh).float()
-        extreme_mask_4d[:, 0, r_idx, c_idx] = is_extreme
+        st_rain = station_target[:, 0, r_idx, c_idx]
+        extreme_mask_4d[:, 0, r_idx, c_idx] = (st_rain >= st_thresh).float()
 
-    train_mask_idx = (gpm_date_strs < '2020-01-01')
-    val_mask_idx   = (gpm_date_strs >= '2020-01-01')
+    # 三集时间切片
+    train_mask_t = (gpm_date_strs < '2020-01-01')                                     # 2012–2019 (训练集)
+    val_mask_t   = (gpm_date_strs >= '2020-01-01') & (gpm_date_strs < '2022-01-01')  # 2020–2021 (验证集)
+    test_mask_t  = (gpm_date_strs >= '2022-01-01')                                     # 2022–2024 (测试集)
 
-    train_ds = ExtremePrecipDataset(gpm_tensor[train_mask_idx], era5_met[train_mask_idx], era5_ext[train_mask_idx], dem_tensor, station_target[train_mask_idx], extreme_mask_4d[train_mask_idx])
-    val_ds   = ExtremePrecipDataset(gpm_tensor[val_mask_idx], era5_met[val_mask_idx], era5_ext[val_mask_idx], dem_tensor, station_target[val_mask_idx], extreme_mask_4d[val_mask_idx])
+    # 训练集与验证集全部加载极值掩膜
+    train_ds = ExtremePrecipDataset(gpm_tensor[train_mask_t], era5_met[train_mask_t], era5_ext[train_mask_t], dem_tensor, station_target[train_mask_t], extreme_mask_4d[train_mask_t])
+    val_ds   = ExtremePrecipDataset(gpm_tensor[val_mask_t],   era5_met[val_mask_t],   era5_ext[val_mask_t],   dem_tensor, station_target[val_mask_t],   extreme_mask_4d[val_mask_t])
 
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=32, shuffle=False)
+    val_loader   = DataLoader(val_ds,   batch_size=32, shuffle=False)
 
     model = PINeuralGPDNet(in_channels=28, out_channels=1).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=4e-4, weight_decay=1e-4)
@@ -320,7 +373,7 @@ def main():
     best_val_loss = float('inf')
     epochs = 35
 
-    print(f"\n⚡ 开始双向残差极值专攻神经网络训练...")
+    print(f"\n⚡ 开始极值网络训练 (验证集同步监听 P90 极值损失以实现早停)...")
     for epoch in range(1, epochs + 1):
         model.train()
         train_loss = 0.0
@@ -351,11 +404,13 @@ def main():
         else:
             saved_mark = ""
 
-        print(f"Epoch [{epoch:02d}/{epochs:02d}] | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} {saved_mark}")
+        print(f"Epoch [{epoch:02d}/{epochs:02d}] | Train (P90) Loss: {train_loss:.4f} | Val (P90) Loss: {val_loss:.4f} {saved_mark}")
 
-    # 推理 2012-2024
+    # =========================================================================
+    # 🌐 8. 全时空推理演算 (2012–2024)
+    # =========================================================================
     print("\n" + "=" * 75)
-    print("🌐 正在执行全流域各站 P90 双向极值场物理推理...")
+    print("🌐 正在执行全时空 (2012–2024) 25×30 全矩阵极值场前向推理...")
     full_ds = ExtremePrecipDataset(gpm_tensor, era5_met, era5_ext, dem_tensor, station_target, extreme_mask_4d)
     full_loader = DataLoader(full_ds, batch_size=64, shuffle=False)
 
@@ -371,63 +426,108 @@ def main():
     full_pred = np.concatenate(pred_list, axis=0)[:, 0, :, :]
     first_day = full_pred[0:1]
     last_day  = full_pred[-1:]
-    full_pred_padded = np.concatenate([first_day, full_pred, last_day], axis=0) # (4747, 25, 30)
+    full_pred_padded = np.concatenate([first_day, full_pred, last_day], axis=0)
 
-    # 盲测复盘
-    val_indices = np.where(val_mask_idx)[0]
-    
-    log_lines = []
-    log_lines.append("==================================================================================")
-    log_lines.append(f"📊【资产 3 各站 P90 双向极值专家】盲测站点复盘 (2020-2024)")
-    log_lines.append("==================================================================================")
-
-    ext_metrics_list = []
-
-    for st_name, (r_idx, c_idx) in station_coords.items():
-        obs_st = station_target.numpy()[val_indices, 0, r_idx, c_idx]
-        pred_st = full_pred_padded[val_indices, r_idx, c_idx]
-        st_p90 = station_p90_thresholds[st_name]
-        
-        rmse, r2, cc, pod, far, csi = calc_metrics_quantile(obs_st, pred_st, threshold=st_p90)
-        ext_metrics_list.append([rmse, r2, cc, pod, far, csi])
-
-        log_lines.append(f"📍 盲测极值【 {st_name:<4} 】(门槛>={st_p90:5.2f}mm/d) | RMSE: {rmse:6.2f} mm/d | R²: {r2:5.3f} | CC: {cc:5.3f} | POD: {pod:4.2f} | FAR: {far:4.2f} | CSI: {csi:4.2f}")
-
-    avg_e = np.mean(ext_metrics_list, axis=0)
-    
-    log_lines.append("----------------------------------------------------------------------------------")
-    log_lines.append(f"🏆【4 站专属 P90 极值平均】 | RMSE: {avg_e[0]:6.2f} mm/d | R²: {avg_e[1]:5.3f} | CC: {avg_e[2]:5.3f} | POD: {avg_e[3]:4.2f} | FAR: {avg_e[4]:4.2f} | CSI: {avg_e[5]:4.2f}")
-    log_lines.append("==================================================================================")
-
-    full_log_text = "\n".join(log_lines)
-    print("\n" + full_log_text)
-    
-    with open(txt_result_path, "w", encoding="utf-8") as f:
-        f.write(full_log_text + "\n\nBest Val Loss: " + f"{best_val_loss:.4f}\n")
-
-    # 🌟【关键修改】：取消流域裁剪，保留完整矩形区域 (25x30) 以便 MOE 门控网络训练
-    print("\n🌐 保持【全矩阵矩形区域 (25x30)】预测结果导出 (已取消 NaN 裁切，供后续 MOE 门控路由网络训练使用)...")
-
+    # 导出无缝全矩阵 NetCDF 资产
     ds_asset3 = xr.Dataset(
-        data_vars={
-            'asset3_precipitation': (['time', 'lat', 'lon'], full_pred_padded)
-        },
-        coords={
-            'time': ds_gpm.time,
-            'lat': ds_gpm.lat,
-            'lon': ds_gpm.lon
-        },
-        attrs={
-            'description': 'Asset 3: Extreme Precipitation Expert (Bidirectional Residual + P90 Quantile Focused)',
-            'spatial_mask': 'Full rectangular grid (25x30) preserved for MOE routing',
-            'extreme_thresholds': str(station_p90_thresholds)
-        }
+        data_vars={'asset3_precipitation': (['time', 'lat', 'lon'], full_pred_padded)},
+        coords={'time': ds_gpm.time, 'lat': ds_gpm.lat, 'lon': ds_gpm.lon},
+        attrs={'description': 'Asset 3: Pure P90 Extreme Precipitation Expert (3-Set Partitioned)', 'thresholds': str(station_p90_thresholds)}
     )
-    
     ds_asset3.to_netcdf(nc_asset3_out)
+    print(f"📦 完整 NetCDF 降水资产已生成: {nc_asset3_out}")
+
+    # =========================================================================
+    # 📈 9. 训练/验证/测试三集【纯 P90 极值样本】严格评估与制表
+    # =========================================================================
+    train_indices = np.where(train_mask_t)[0]
+    val_indices   = np.where(val_mask_t)[0]
+    test_indices  = np.where(test_mask_t)[0]
+
+    def evaluate_split_extreme(split_indices):
+        st_metrics = {}
+        for st_name, (r_idx, c_idx) in station_coords.items():
+            obs_st = station_target.numpy()[split_indices, 0, r_idx, c_idx]
+            pred_st = full_pred_padded[split_indices, r_idx, c_idx]
+            p90 = station_p90_thresholds[st_name]
+            st_metrics[st_name] = calc_pure_extreme_metrics(obs_st, pred_st, threshold=p90)
+        
+        all_vals = np.array(list(st_metrics.values()))
+        avg_vals = np.mean(all_vals, axis=0).tolist()
+        return st_metrics, avg_vals
+
+    train_st_m, train_avg = evaluate_split_extreme(train_indices)
+    val_st_m,   val_avg   = evaluate_split_extreme(val_indices)
+    test_st_m,  test_avg  = evaluate_split_extreme(test_indices)
+
+    # -------------------------------------------------------------------------
+    # 表 1：三集极值评估指标汇总表 (严格匹配 Word 格式)
+    # -------------------------------------------------------------------------
+    metric_names = ['MAE', 'MSE', 'RMSE', 'R²', 'NSE', 'KGE', 'CC', 'POD', 'FAR', 'CSI']
+    metric_units = ['mm/d', 'mm²/d²', 'mm/d', '—', '—', '—', '—', '—', '—', '—']
     
+    table1_data = []
+    for i in range(len(metric_names)):
+        table1_data.append([
+            metric_names[i],
+            metric_units[i],
+            f"{train_avg[i]:.3f}",
+            f"{val_avg[i]:.3f}",
+            f"{test_avg[i]:.3f}"
+        ])
+
+    df_table1 = pd.DataFrame(table1_data, columns=['评估指标', '单位', '训练集 (2012–2019)', '验证集 (2020–2021)', '测试集 (2022–2024)'])
+
+    # -------------------------------------------------------------------------
+    # 表 2：站点详情 (测试集 2022–2024 P90 极值)
+    # -------------------------------------------------------------------------
+    table2_data = []
+    for st_name in ['连州', '韶关', '佛冈', '连平']:
+        m = test_st_m[st_name]
+        table2_data.append([
+            st_name,
+            f"{m[1]:.2f}", f"{m[0]:.2f}", f"{m[2]:.2f}",
+            f"{m[3]:.3f}", f"{m[4]:.3f}", f"{m[5]:.3f}",
+            f"{m[7]:.2f}", f"{m[8]:.2f}", f"{m[9]:.2f}"
+        ])
+    table2_data.append([
+        '平均',
+        f"{test_avg[1]:.2f}", f"{test_avg[0]:.2f}", f"{test_avg[2]:.2f}",
+        f"{test_avg[3]:.3f}", f"{test_avg[4]:.3f}", f"{test_avg[5]:.3f}",
+        f"{test_avg[7]:.2f}", f"{test_avg[8]:.2f}", f"{test_avg[9]:.2f}"
+    ])
+
+    df_table2 = pd.DataFrame(table2_data, columns=[
+        '站点', 'MSE (mm²/d²)', 'MAE (mm/d)', 'RMSE (mm/d)', 'R²', 'NSE', 'KGE', 'POD', 'FAR', 'CSI'
+    ])
+
+    # 终端打印输出
+    print("\n" + "=" * 75)
+    print("📊【表 1：三集极值评估指标汇总对比表 (P90 样本)】")
     print("=" * 75)
-    print(f"🎉 🎉 🎉 资产 3 (全矩阵矩形导出版) 构建完工！已保存至:\n  📦 {nc_asset3_out}")
+    print(df_table1.to_string(index=False))
+
+    print("\n" + "=" * 75)
+    print("📊【表 2：测试集 (2022–2024) 各站点极值详情表 (P90 样本)】")
+    print("=" * 75)
+    print(df_table2.to_string(index=False))
+
+    # 保存 TXT 文本
+    with open(txt_result_path, "w", encoding="utf-8") as f:
+        f.write("=== 三集极值评估指标汇总对比表 (P90 样本) ===\n")
+        f.write(df_table1.to_string(index=False) + "\n\n")
+        f.write("=== 测试集 (2022–2024) 各站点极值详情表 (P90 样本) ===\n")
+        f.write(df_table2.to_string(index=False) + "\n")
+
+    # 渲染学术表格图片
+    png_table1_path = os.path.join(save_fig_dir, "05_三集极值评估指标汇总表.png")
+    png_table2_path = os.path.join(save_fig_dir, "06_测试集各站点极值详情表.png")
+    
+    render_table_to_png(df_table1, "三集极值评估指标汇总 (P90 样本)", png_table1_path, figsize=(10, 5))
+    render_table_to_png(df_table2, "测试集 (2022–2024) 各站点极值详情表", png_table2_path, figsize=(11.5, 3.8))
+
+    print("\n" + "=" * 75)
+    print("🎉 🎉 🎉 纯极值三集划分训练、评估与两份标准表格已输出完毕！")
     print("=" * 75)
 
 if __name__ == "__main__":
